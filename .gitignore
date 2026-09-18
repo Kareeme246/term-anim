@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Personal content - regenerate via the CLI or GUI (see README).
+script.json
+
+# Generated recordings and renders (record.sh output).
+demo.cast
+banner-*.svg
+
+themes/*.svg
+!themes/_base_window_frame.svg
+themes/palettes/live.json
+
