@@ -67,9 +67,13 @@ uv run themes/set_terminal_opacity.py banner-kanagawa_wave.svg --opacity 0.85 [-
 
 # Add a solid or two-color background
 uv run themes/add_background.py banner-kanagawa_wave.svg [--bg HEX] [--bg-to HEX] [--angle DEGREES] [--padding PX] [--no-shadow] [--out PATH]
+
+# Scale the whole banner uniformly (keeps the aspect ratio); apply last
+uv run themes/set_scale.py banner-kanagawa_wave.svg --scale 2.0 [--out PATH]
 ```
 
-If combining them, remove the chrome first. `--bg-to` enables a gradient, while `--angle` controls its direction.
+If combining them, remove the chrome first, then apply `set_scale.py` last - it
+measures whatever the outermost element is, including a background frame.
 
 ## Known limitations
 

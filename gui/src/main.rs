@@ -106,6 +106,17 @@ const BG_GRADIENTS: &[(&str, egui::Color32, egui::Color32)] = &[
     ),
 ];
 
+// Banner-size presets. A uniform scale keeps the aspect ratio fixed, so
+// every step is the same banner, just larger - see set_scale.py. Applied
+// last, after any background frame.
+const SCALE_PRESETS: &[(&str, f32)] = &[
+    ("0.75x", 0.75),
+    ("1x", 1.0),
+    ("1.5x", 1.5),
+    ("2x", 2.0),
+    ("3x", 3.0),
+];
+
 enum WorkerMsg {
     Log(String),
     RecordDone(Result<PathBuf, String>),
@@ -141,6 +152,7 @@ struct TermAnimApp {
     apply_background: bool,
     gradient_index: usize,
     padding: f32,
+    scale_index: usize,
     busy: bool,
     busy_started: Option<Instant>,
     busy_estimate_secs: f32,
@@ -430,6 +442,7 @@ impl TermAnimApp {
             apply_background: false,
             gradient_index: 0,
             padding: 30.0,
+            scale_index: 1,
             busy: false,
             busy_started: None,
             busy_estimate_secs: 1.0,
@@ -492,6 +505,7 @@ impl TermAnimApp {
         let bg_from = color32_to_hex(gradient_from);
         let bg_to = color32_to_hex(gradient_to);
         let padding = self.padding;
+        let scale = SCALE_PRESETS[self.scale_index].1;
 
         // Rough estimate for the progress bar, not meant to be exact:
         let total_chars: usize = turns.iter().map(|t| t.command.chars().count()).sum();
@@ -623,6 +637,25 @@ impl TermAnimApp {
                         .unwrap_or("banner")
                         .to_string();
                     current = format!("{stem}-framed.svg");
+                }
+
+                if (scale - 1.0).abs() > 0.001 {
+                    tx.send(WorkerMsg::Log(format!("scaling banner {scale}x")))
+                        .ok();
+                    let mut cmd = Command::new("uv");
+                    cmd.arg("run")
+                        .arg("themes/set_scale.py")
+                        .arg(&current)
+                        .arg("--scale")
+                        .arg(scale.to_string())
+                        .current_dir(&root);
+                    run_step(cmd, "set_scale.py")?;
+                    let stem = Path::new(&current)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("banner")
+                        .to_string();
+                    current = format!("{stem}-scaled.svg");
                 }
 
                 Ok(root.join(current))
@@ -867,6 +900,21 @@ impl eframe::App for TermAnimApp {
                     ui.add_space(12.0);
                     ui.label("Terminal opacity");
                     ui.add(egui::Slider::new(&mut self.opacity, 0.1..=1.0));
+
+                    ui.add_space(12.0);
+                    ui.label("Banner size");
+                    egui::ComboBox::from_id_salt("banner_size")
+                        .selected_text(SCALE_PRESETS[self.scale_index].0)
+                        .show_ui(ui, |ui| {
+                            for (i, (label, _)) in SCALE_PRESETS.iter().enumerate() {
+                                ui.selectable_value(&mut self.scale_index, i, *label);
+                            }
+                        });
+                    ui.label(
+                        egui::RichText::new("Uniform scale - the aspect ratio never changes.")
+                            .small()
+                            .weak(),
+                    );
 
                     ui.add_space(12.0);
                     ui.label("Typing speed");
