@@ -9,12 +9,16 @@ _base_window_frame.svg): a title-bar strip up top (three traffic-light
 dots, a centered title, and a divider line) sitting directly above the
 terminal screen, which itself is flush against the left/right/bottom
 edges already. This strips that strip off entirely: removes the circles,
-title text, and divider, squares off the window background's rounded
-corners, then slides the screen up to the origin and crops the canvas down
-to match it - so the terminal output becomes the whole frame, with no
-padding on any side. Doesn't touch colors, text, scale, or animation; the
-screen's own width/height/viewBox are untouched, so nothing stretches or
-distorts - it's purely a reposition + crop.
+title text, and divider, slides the screen up to the origin, and crops the
+canvas down to match - so the terminal output becomes the whole frame,
+with no padding on any side. Doesn't touch colors, text, scale, or
+animation; the screen's own width/height/viewBox are untouched, so nothing
+stretches or distorts - it's purely a reposition + crop.
+
+The frame keeps #terminalui's rounded corners (see _base_window_frame.svg),
+and the screen is clipped to the same rounded shape: with the title bar
+gone, the first line of terminal text sits right at the top edge, so
+without the clip its glyphs and cursor would spill past the curves.
 
 Usage:
     uv run themes/strip_chrome.py banner-kanagawa_wave.svg
@@ -30,15 +34,18 @@ CIRCLE_RE = re.compile(r'\s*<circle[^>]*class="color[123]"[^>]*/>')
 TITLE_TEXT_RE = re.compile(r'\s*<text id="chrome-title"[^>]*?(?:/>|>[^<]*</text>)')
 DIVIDER_RE = re.compile(r'\s*<rect id="chrome-divider"[^>]*/>')
 # #terminalui is the window background sitting behind the (transparent-bg)
-# screen - see build_themes.py. Chromeless mode keeps it as the one opaque
-# background for the frame, but drops its corner rounding so the terminal
-# fills the whole canvas with square, flush edges and no transparent nicks.
-TERMINALUI_ROUNDING_RE = re.compile(r'(<rect id="terminalui"[^>]*?)\s+ry="\d+"')
+# screen - see build_themes.py. Chromeless mode keeps it, rounding and all,
+# as the frame's background; the screen is clipped to the same rounded
+# shape so the first line of text can't spill past the curves.
+TERMINALUI_ROUNDING_RE = re.compile(
+    r'<rect id="terminalui"[^>]*?\bry="(\d+)"'
+)
 SCREEN_TAG_RE = re.compile(
     r'<svg id="screen" width="(\d+)" height="(\d+)" x="\d+" y="\d+" '
     r'viewBox="0 0 \d+ \d+"'
 )
 OUTER_VIEWBOX_RE = re.compile(r'viewBox="0 0 (\d+) \d+" width="\d+"')
+CLIP_ID = "term-anim-rounded"
 
 
 def strip_chrome(svg_text):
@@ -50,11 +57,21 @@ def strip_chrome(svg_text):
     svg_text = CIRCLE_RE.sub("", svg_text)
     svg_text = TITLE_TEXT_RE.sub("", svg_text)
     svg_text = DIVIDER_RE.sub("", svg_text)
-    svg_text = TERMINALUI_ROUNDING_RE.sub(r"\1", svg_text)
+
+    rounding = TERMINALUI_ROUNDING_RE.search(svg_text)
+    if not rounding:
+        raise RuntimeError('Could not find #terminalui\'s corner rounding')
+    radius = rounding.group(1)
+    clip_path = (
+        f'<clipPath id="{CLIP_ID}">'
+        f'<rect width="{screen_w}" height="{screen_h}" rx="{radius}" ry="{radius}"/>'
+        f"</clipPath>"
+    )
+    svg_text = svg_text.replace("</defs>", clip_path + "</defs>", 1)
 
     svg_text = SCREEN_TAG_RE.sub(
         f'<svg id="screen" width="{screen_w}" height="{screen_h}" x="0" y="0" '
-        f'viewBox="0 0 {screen_w} {screen_h}"',
+        f'viewBox="0 0 {screen_w} {screen_h}" clip-path="url(#{CLIP_ID})"',
         svg_text,
         count=1,
     )
