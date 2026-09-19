@@ -2,24 +2,22 @@
 
 Create animated SVGs of scripted terminal sessions with a native desktop app. Commands are displayed, not executed, so demos are safe and repeatable.
 
-Built on termtosvg, with themes from iTerm2-Color-Schemes.
-
 ## Demo
 
 > Demo video coming soon.
 
 ## Quick start
 
-term-anim is currently source-only. A downloadable app will replace these build steps later.
+term-anim is currently source-only. A downloadable binary will replace these build steps later.
 
 ### Prerequisites
 
 - [Git](https://git-scm.com/downloads)
-- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - [Rust](https://rustup.rs/)
 - A real terminal window for recording
 
-### Download and run
+### Quick start
 
 ```sh
 git clone https://github.com/Kareeme246/term-anim.git
@@ -31,7 +29,7 @@ Add your commands and output as turns, choose the appearance, then click **Recor
 
 ## CLI
 
-If you do not want to use the app, run the recorder directly from the project root:
+If you do not want to use the app, you can run the recorder directly from the project root:
 
 ```sh
 ./record.sh [theme] [speed] [loop-delay-ms]
@@ -78,5 +76,10 @@ measures whatever the outermost element is, including a background frame.
 ## Known limitations
 
 - Recording and live-theme detection require a real controlling TTY. They cannot run from CI, a plain pipe, or a sandboxed agent shell.
-- The cursor is a static inverted-color block, not an animated blink. Play-once animations freeze with the same static cursor.
-- Apple's Terminal.app does not support the color queries used by live-theme detection.
+- Some terminal's dont support the color queries used for live-theme detection (e.g. Apple's Terminal.app).
+- The cursor is a static inverted-color block, so we can't support an animated blink.
+
+
+
+Built on [termtosvg]()
+Themes from [iTerm2-Color-Schemes]().
