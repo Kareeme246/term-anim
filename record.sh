@@ -24,7 +24,9 @@ cd "$(dirname "$0")"
 THEME="${1:-kanagawa_wave}"
 SPEED="${2:-1.0}"
 LOOP_DELAY_MS="${3:-5000}"
-GEOMETRY="92x24"
+# Size the recording to the script so a long session never scrolls its own
+# start off-screen - see banner.py's geometry().
+GEOMETRY="$(uv run banner.py --geometry 2>/dev/null || echo 92x28)"
 
 if [ -f "themes/${THEME}.svg" ]; then
     TEMPLATE="themes/${THEME}.svg"

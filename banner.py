@@ -16,9 +16,13 @@ Usage:
 import argparse
 import json
 import random
+import re
 import sys
 import time
 from pathlib import Path
+
+# Strips SGR codes when measuring how wide a line actually renders.
+ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
 
 # ANSI SGR codes - termtosvg records these and maps them onto whichever
 # theme's palette is active at render time, so the same codes look right
@@ -83,6 +87,23 @@ def load_script(path):
     return data.get("user_host", ""), data["turns"]
 
 
+def geometry(turns, user_host):
+    """Terminal size needed to replay these turns on one screen as
+    WIDTHxHEIGHT, for termtosvg's -g. Width is the longest visible line
+    (so nothing wraps, floored at 92 for a banner-ish shape); height is
+    the rows the session runs through, plus one spare so the closing
+    prompt isn't flush against the bottom. record.sh calls this so a
+    longer script never scrolls its own start off-screen."""
+    prompt = build_prompt(user_host)
+    text = ""
+    for turn in turns:
+        text += prompt + turn.get("command", "") + "\n" + turn.get("output", "")
+    text += prompt + "\n" + prompt
+    lines = ANSI_SGR.sub("", text).split("\n")
+    width = max(92, max(len(line) for line in lines) + 1)
+    return f"{width}x{len(lines) + 1}"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play a scripted fake-typed terminal session.")
     parser.add_argument(
@@ -93,6 +114,13 @@ if __name__ == "__main__":
         "--speed", type=float, default=1.0,
         help="Typing speed multiplier: 1.0 is default pace, 2.0 is twice as fast, 0.5 is twice as slow.",
     )
+    parser.add_argument(
+        "--geometry", action="store_true",
+        help="Print the terminal size (WIDTHxHEIGHT) this script needs and exit, instead of playing it.",
+    )
     args = parser.parse_args()
     user_host, turns = load_script(args.script)
+    if args.geometry:
+        print(geometry(turns, user_host))
+        sys.exit(0)
     play(turns, build_prompt(user_host), speed=args.speed)
