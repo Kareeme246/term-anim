@@ -1137,7 +1137,26 @@ impl eframe::App for TermAnimApp {
                     self.turns.push(Turn::default());
                 }
                 ui.separator();
-                ui.add(egui::TextEdit::singleline(&mut self.user_host).hint_text("user@host"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.user_host)
+                        .hint_text("user@host")
+                        .desired_width(180.0),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!self.busy && self.root_ok, egui::Button::new("Save"))
+                        .on_hover_text("Write the current prompt and turns to script.json")
+                        .clicked()
+                    {
+                        match self.save_script_file() {
+                            Ok(()) => {
+                                self.last_error = None;
+                                self.status_log.push_str("saved script.json\n");
+                            }
+                            Err(error) => self.last_error = Some(error),
+                        }
+                    }
+                });
             });
             ui.add_space(8.0);
             ui.separator();
@@ -1211,23 +1230,6 @@ impl eframe::App for TermAnimApp {
             {
                 self.turns.swap(i, i + 1);
             }
-
-            ui.add_space(8.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!self.busy && self.root_ok, egui::Button::new("Save"))
-                    .on_hover_text("Write the current prompt and turns to script.json")
-                    .clicked()
-                {
-                    match self.save_script_file() {
-                        Ok(()) => {
-                            self.last_error = None;
-                            self.status_log.push_str("saved script.json\n");
-                        }
-                        Err(error) => self.last_error = Some(error),
-                    }
-                }
-            });
         });
     }
 }
