@@ -343,6 +343,28 @@ fn parse_script(text: &str) -> Option<(String, Vec<Turn>)> {
     Some((script.user_host, turns))
 }
 
+fn serialize_script(user_host: &str, turns: &[Turn]) -> Result<String, String> {
+    let script = ScriptFile {
+        user_host: user_host.trim().to_string(),
+        turns: turns
+            .iter()
+            .map(|turn| Turn {
+                command: turn.command.clone(),
+                output: display_to_ansi(&turn.output),
+            })
+            .collect(),
+    };
+    serde_json::to_string_pretty(&script)
+        .map_err(|e| format!("failed to serialize script.json: {e}"))
+}
+
+fn write_script(path: &Path, user_host: &str, turns: &[Turn]) -> Result<String, String> {
+    let contents = serialize_script(user_host, turns)?;
+    std::fs::write(path, &contents)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(contents)
+}
+
 fn load_script(root: &Path) -> (String, Vec<Turn>) {
     let path = root.join("script.json");
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -475,6 +497,14 @@ impl TermAnimApp {
             status_log: String::new(),
             rx: None,
         }
+    }
+
+    fn save_script_file(&mut self) -> Result<(), String> {
+        let path = self.project_root.join("script.json");
+        let contents = write_script(&path, &self.user_host, &self.turns)?;
+        self.last_script_contents = Some(contents);
+        self.last_script_check = Instant::now();
+        Ok(())
     }
 
     fn theme_arg(&self) -> String {
@@ -1181,6 +1211,23 @@ impl eframe::App for TermAnimApp {
             {
                 self.turns.swap(i, i + 1);
             }
+
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.busy && self.root_ok, egui::Button::new("Save"))
+                    .on_hover_text("Write the current prompt and turns to script.json")
+                    .clicked()
+                {
+                    match self.save_script_file() {
+                        Ok(()) => {
+                            self.last_error = None;
+                            self.status_log.push_str("saved script.json\n");
+                        }
+                        Err(error) => self.last_error = Some(error),
+                    }
+                }
+            });
         });
     }
 }
@@ -1227,6 +1274,25 @@ mod tests {
         assert!(script_contents_if_changed(&path, &mut last_contents).is_none());
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_writes_current_prompt_turns_and_ansi_colors() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("term-anim-save-{unique}.json"));
+        let turns = vec![Turn {
+            command: "whoami".to_string(),
+            output: "{{1;36}}Kareem{{0}}".to_string(),
+        }];
+        write_script(&path, " kareem@offline-studios ", &turns).unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        let on_disk: ScriptFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(on_disk.user_host, "kareem@offline-studios");
+        assert_eq!(on_disk.turns[0].output, "\x1b[1;36mKareem\x1b[0m");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
