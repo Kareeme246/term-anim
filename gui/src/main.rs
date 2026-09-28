@@ -138,6 +138,8 @@ const CATCHUP_SECS: f32 = 0.4;
 struct TermAnimApp {
     project_root: PathBuf,
     root_ok: bool,
+    last_script_check: Instant,
+    last_script_contents: Option<String>,
     user_host: String,
     turns: Vec<Turn>,
     themes: Vec<String>,
@@ -318,22 +320,18 @@ fn effective_window_title(user_host: &str, typed: &str) -> String {
 // script.json's turns, converted to display form (see ansi_to_display),
 // plus its user_host (the prompt's "user@host" - see banner.py's
 // build_prompt).
-fn load_script(root: &Path) -> (String, Vec<Turn>) {
-    let path = root.join("script.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return (detect_user_host(), Vec::new());
-    };
+fn parse_script(text: &str) -> Option<(String, Vec<Turn>)> {
     // Old script.json files are a bare `[...]` array of turns with no
     // user_host field at all - fall back to that shape if the new
     // object shape doesn't parse.
-    let script: ScriptFile = serde_json::from_str(&text)
+    let script: ScriptFile = serde_json::from_str(text)
         .or_else(|_| {
-            serde_json::from_str::<Vec<Turn>>(&text).map(|turns| ScriptFile {
+            serde_json::from_str::<Vec<Turn>>(text).map(|turns| ScriptFile {
                 user_host: String::new(),
                 turns,
             })
         })
-        .unwrap_or_default();
+        .ok()?;
     let turns = script
         .turns
         .into_iter()
@@ -342,7 +340,49 @@ fn load_script(root: &Path) -> (String, Vec<Turn>) {
             output: ansi_to_display(&t.output),
         })
         .collect();
-    (script.user_host, turns)
+    Some((script.user_host, turns))
+}
+
+fn serialize_script(user_host: &str, turns: &[Turn]) -> Result<String, String> {
+    let script = ScriptFile {
+        user_host: user_host.trim().to_string(),
+        turns: turns
+            .iter()
+            .map(|turn| Turn {
+                command: turn.command.clone(),
+                output: display_to_ansi(&turn.output),
+            })
+            .collect(),
+    };
+    serde_json::to_string_pretty(&script)
+        .map_err(|e| format!("failed to serialize script.json: {e}"))
+}
+
+fn write_script(path: &Path, user_host: &str, turns: &[Turn]) -> Result<String, String> {
+    let contents = serialize_script(user_host, turns)?;
+    std::fs::write(path, &contents)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(contents)
+}
+
+fn load_script(root: &Path) -> (String, Vec<Turn>) {
+    let path = root.join("script.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (detect_user_host(), Vec::new());
+    };
+    parse_script(&text).unwrap_or_default()
+}
+
+const SCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+// Detect edits from external editors, including atomic-save rename patterns.
+fn script_contents_if_changed(path: &Path, last_contents: &mut Option<String>) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    if last_contents.as_deref() == Some(contents.as_str()) {
+        return None;
+    }
+    *last_contents = Some(contents.clone());
+    Some(contents)
 }
 
 fn color32_to_hex(c: egui::Color32) -> String {
@@ -420,6 +460,7 @@ impl TermAnimApp {
         let root_ok = project_root.join("record.sh").exists();
         let themes = discover_themes(&project_root);
         let (user_host, turns) = load_script(&project_root);
+        let last_script_contents = std::fs::read_to_string(project_root.join("script.json")).ok();
         // The window-title field starts empty: its hint is derived
         // live from user_host - see effective_window_title. Empty
         // lets the hint show and keeps the two fields in sync until
@@ -428,6 +469,8 @@ impl TermAnimApp {
         Self {
             project_root,
             root_ok,
+            last_script_check: Instant::now(),
+            last_script_contents,
             user_host,
             turns,
             selected_theme: 0,
@@ -454,6 +497,14 @@ impl TermAnimApp {
             status_log: String::new(),
             rx: None,
         }
+    }
+
+    fn save_script_file(&mut self) -> Result<(), String> {
+        let path = self.project_root.join("script.json");
+        let contents = write_script(&path, &self.user_host, &self.turns)?;
+        self.last_script_contents = Some(contents);
+        self.last_script_check = Instant::now();
+        Ok(())
     }
 
     fn theme_arg(&self) -> String {
@@ -720,6 +771,26 @@ impl TermAnimApp {
         });
     }
 
+    fn poll_script_changes(&mut self, ctx: &egui::Context) {
+        ctx.request_repaint_after(SCRIPT_POLL_INTERVAL);
+        if self.last_script_check.elapsed() < SCRIPT_POLL_INTERVAL {
+            return;
+        }
+        self.last_script_check = Instant::now();
+        let Some(contents) = script_contents_if_changed(
+            &self.project_root.join("script.json"),
+            &mut self.last_script_contents,
+        ) else {
+            return;
+        };
+        if let Some((user_host, turns)) = parse_script(&contents) {
+            self.user_host = user_host;
+            self.turns = turns;
+            self.status_log
+                .push_str("reloaded script.json after external change\n");
+        }
+    }
+
     fn poll_worker(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.rx {
             while let Ok(msg) = rx.try_recv() {
@@ -784,6 +855,7 @@ impl TermAnimApp {
 impl eframe::App for TermAnimApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_script_changes(&ctx);
         self.poll_worker(&ctx);
 
         egui::Panel::top("top").show(ui, |ui| {
@@ -1065,7 +1137,26 @@ impl eframe::App for TermAnimApp {
                     self.turns.push(Turn::default());
                 }
                 ui.separator();
-                ui.add(egui::TextEdit::singleline(&mut self.user_host).hint_text("user@host"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.user_host)
+                        .hint_text("user@host")
+                        .desired_width(180.0),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!self.busy && self.root_ok, egui::Button::new("Save"))
+                        .on_hover_text("Write the current prompt and turns to script.json")
+                        .clicked()
+                    {
+                        match self.save_script_file() {
+                            Ok(()) => {
+                                self.last_error = None;
+                                self.status_log.push_str("saved script.json\n");
+                            }
+                            Err(error) => self.last_error = Some(error),
+                        }
+                    }
+                });
             });
             ui.add_space(8.0);
             ui.separator();
@@ -1155,6 +1246,56 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_poll_detects_external_atomic_replacement() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("term-anim-watch-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.json");
+        std::fs::write(&path, r#"{"user_host":"before","turns":[]}"#).unwrap();
+        let mut last_contents = std::fs::read_to_string(&path).ok();
+
+        let replacement = dir.join("script.json.tmp");
+        std::fs::write(
+            &replacement,
+            r#"{"user_host":"after","turns":[{"command":"whoami","output":"Kareem"}]}"#,
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let contents = script_contents_if_changed(&path, &mut last_contents)
+            .expect("poll did not report the external file replacement");
+        let (user_host, turns) = parse_script(&contents).expect("updated script should parse");
+        assert_eq!(user_host, "after");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].command, "whoami");
+        assert!(script_contents_if_changed(&path, &mut last_contents).is_none());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_writes_current_prompt_turns_and_ansi_colors() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("term-anim-save-{unique}.json"));
+        let turns = vec![Turn {
+            command: "whoami".to_string(),
+            output: "{{1;36}}Kareem{{0}}".to_string(),
+        }];
+        write_script(&path, " kareem@offline-studios ", &turns).unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        let on_disk: ScriptFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(on_disk.user_host, "kareem@offline-studios");
+        assert_eq!(on_disk.turns[0].output, "\x1b[1;36mKareem\x1b[0m");
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn ansi_display_round_trip() {
