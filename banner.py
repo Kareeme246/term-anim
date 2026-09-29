@@ -72,9 +72,11 @@ def play(turns, prompt, speed=1.0):
 
         time.sleep(POST_OUTPUT_PAUSE / speed)
 
-    # Outro: a second bare prompt, cursor left resting at the end. Not
-    # scaled by speed - it's a fixed reading pause, not a typing delay.
-    sys.stdout.write(prompt + "\n" + prompt)
+    # Outro: one bare prompt, cursor left resting at the end. Any blank
+    # line before it comes from the last turn's output, so scripts choose
+    # their own spacing. The hold isn't scaled by speed - it's a fixed
+    # reading pause, not a typing delay.
+    sys.stdout.write(prompt)
     sys.stdout.flush()
     time.sleep(OUTRO_HOLD)
 
@@ -98,7 +100,7 @@ def geometry(turns, user_host):
     text = ""
     for turn in turns:
         text += prompt + turn.get("command", "") + "\n" + turn.get("output", "")
-    text += prompt + "\n" + prompt
+    text += prompt
     lines = ANSI_SGR.sub("", text).split("\n")
     width = max(92, max(len(line) for line in lines) + 1)
     return f"{width}x{len(lines) + 1}"
