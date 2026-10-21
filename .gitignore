@@ -5,6 +5,10 @@ __pycache__/
 # Personal content - regenerate via the CLI or GUI (see README).
 script.json
 
+# The user's own saved scripts (one data/scripts/<slug>.json per script) -
+# see gui/src/script_library.rs. These are personal, never committed.
+data/
+
 # Generated recordings and renders (record.sh output).
 demo.cast
 banner-*.svg
