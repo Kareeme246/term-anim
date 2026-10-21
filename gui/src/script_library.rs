@@ -89,9 +89,6 @@ pub fn suggest_name(first_command: &str) -> String {
 
 // Script names (file stems), sorted, *.json only. A missing directory means
 // no scripts yet rather than an error, so the app works on a fresh checkout.
-// No caller yet: the follow-on task that lets a user pick a previous script
-// codes against this.
-#[allow(dead_code)]
 pub fn list(root: &Path) -> Vec<String> {
     let dir = scripts_dir(root);
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -137,8 +134,6 @@ pub fn save(root: &Path, name: &str, contents: &str) -> Result<String, String> {
 }
 
 // The raw contents of a saved script. Takes a script name, not a path.
-// No caller yet: see the note on list.
-#[allow(dead_code)]
 pub fn load(root: &Path, name: &str) -> Result<String, String> {
     let (_, path) = script_path(root, name)?;
     std::fs::read_to_string(&path).map_err(|e| {
