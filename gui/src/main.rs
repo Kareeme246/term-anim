@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 mod script_library;
 
@@ -170,6 +170,15 @@ struct TermAnimApp {
     // (see script_library). Empty means "not named yet": a recording falls
     // back to suggest_name on the first turn's command.
     script_name: String,
+    // The script picker: what the library held when it was last opened,
+    // its search box, the saved script last opened into the editor, a pick
+    // waiting on the discard-unsaved-changes confirm, and the last failed
+    // pick.
+    library: Vec<LibraryEntry>,
+    library_filter: String,
+    opened_script: Option<String>,
+    pending_open: Option<String>,
+    library_error: Option<String>,
     rx: Option<Receiver<WorkerMsg>>,
 }
 
@@ -286,12 +295,16 @@ fn detect_hostname() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-// The theme-search ComboBox's button id. Must match how egui's
+// A searchable ComboBox's button id. Must match how egui's
 // ComboBox::from_id_salt derives its own internal id -
 // make_persistent_id(IdSalt::new(salt)), not make_persistent_id(salt),
 // which hashes differently.
+fn combo_button_id(ui: &egui::Ui, salt: &str) -> egui::Id {
+    ui.make_persistent_id(egui::IdSalt::new(salt))
+}
+
 fn theme_combo_button_id(ui: &egui::Ui) -> egui::Id {
-    ui.make_persistent_id(egui::IdSalt::new("theme_combo"))
+    combo_button_id(ui, "theme_combo")
 }
 
 fn detect_user_host() -> String {
@@ -379,6 +392,130 @@ fn load_script(root: &Path) -> (String, Vec<Turn>) {
     parse_script(&text).unwrap_or_default()
 }
 
+// One saved script as the script picker lists it - see library_entries.
+struct LibraryEntry {
+    name: String,
+    // Turn count and first command. None when the file can't be read or
+    // parsed: the row still shows, hinted "unreadable", and picking it
+    // reports the load error.
+    summary: Option<(usize, String)>,
+    modified: Option<SystemTime>,
+}
+
+// The saved scripts, newest first. Every file is read for its summary, so
+// this runs when the picker opens rather than every frame.
+fn library_entries(root: &Path) -> Vec<LibraryEntry> {
+    let dir = script_library::scripts_dir(root);
+    let mut entries: Vec<LibraryEntry> = script_library::list(root)
+        .into_iter()
+        .map(|name| {
+            let summary = script_library::load(root, &name)
+                .ok()
+                .and_then(|text| parse_script(&text))
+                .map(|(_, turns)| {
+                    let first = turns
+                        .first()
+                        .map(|turn| turn.command.clone())
+                        .unwrap_or_default();
+                    (turns.len(), first)
+                });
+            let modified = std::fs::metadata(dir.join(format!("{name}.json")))
+                .and_then(|m| m.modified())
+                .ok();
+            LibraryEntry {
+                name,
+                summary,
+                modified,
+            }
+        })
+        .collect();
+    // list() is already sorted by name and the sort is stable, so ties keep
+    // that order; a missing time sorts last.
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
+    entries
+}
+
+fn format_age(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    match secs {
+        0..60 => "just now".to_string(),
+        60..3_600 => format!("{}m ago", secs / 60),
+        3_600..86_400 => format!("{}h ago", secs / 3_600),
+        86_400..604_800 => format!("{}d ago", secs / 86_400),
+        _ => format!("{}w ago", secs / 604_800),
+    }
+}
+
+// The dim text on the right of a picker row, e.g. "3 turns · whoami · 2h ago".
+fn library_hint(entry: &LibraryEntry, now: SystemTime) -> String {
+    const MAX_COMMAND_CHARS: usize = 32;
+    let mut parts = Vec::new();
+    match &entry.summary {
+        Some((count, first)) => {
+            parts.push(format!(
+                "{count} turn{}",
+                if *count == 1 { "" } else { "s" }
+            ));
+            if !first.is_empty() {
+                if first.chars().count() > MAX_COMMAND_CHARS {
+                    let cut: String = first.chars().take(MAX_COMMAND_CHARS - 3).collect();
+                    parts.push(format!("{cut}..."));
+                } else {
+                    parts.push(first.clone());
+                }
+            }
+        }
+        None => parts.push("unreadable".to_string()),
+    }
+    if let Some(elapsed) = entry
+        .modified
+        .and_then(|modified| now.duration_since(modified).ok())
+    {
+        parts.push(format_age(elapsed));
+    }
+    parts.join(" · ")
+}
+
+// A saved script, converted to the editor's display form, or why it can't
+// be opened.
+fn load_library_script(root: &Path, name: &str) -> Result<(String, Vec<Turn>), String> {
+    let text = script_library::load(root, name)?;
+    parse_script(&text).ok_or_else(|| "not a valid script file".to_string())
+}
+
+// Whether the editor holds anything that isn't in script.json. Both sides go
+// through serialize_script, so a script.json that was only reformatted by an
+// external editor doesn't count as a change.
+fn has_unsaved_edits(user_host: &str, turns: &[Turn], saved: Option<&str>) -> bool {
+    let Ok(current) = serialize_script(user_host, turns) else {
+        return true;
+    };
+    match saved.and_then(parse_script) {
+        Some((saved_host, saved_turns)) => {
+            serialize_script(&saved_host, &saved_turns).ok() != Some(current)
+        }
+        None => !turns.is_empty(),
+    }
+}
+
+// The line under the script picker saying what a recording will be filed
+// as. Re-using an existing name overwrites it silently, so that case has no
+// caption at all.
+fn script_name_caption(root: &Path, script_name: &str, turns: &[Turn]) -> Option<String> {
+    if script_name.trim().is_empty() {
+        let first = turns.first().map(|t| t.command.as_str()).unwrap_or("");
+        return Some(format!(
+            "Empty name: recording saves this as \"{}\" (from the first command).",
+            script_library::suggest_name(first)
+        ));
+    }
+    let slug = script_library::slugify(script_name);
+    let exists = script_library::scripts_dir(root)
+        .join(format!("{slug}.json"))
+        .is_file();
+    (!exists).then(|| format!("New script - recording saves it as \"{slug}\"."))
+}
+
 const SCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 // Detect edits from external editors, including atomic-save rename patterns.
@@ -462,9 +599,13 @@ fn reveal_in_file_manager(path: &Path) {
 
 impl TermAnimApp {
     fn new() -> Self {
-        let project_root = find_project_root();
+        Self::with_root(find_project_root())
+    }
+
+    fn with_root(project_root: PathBuf) -> Self {
         let root_ok = project_root.join("record.sh").exists();
         let themes = discover_themes(&project_root);
+        let library = library_entries(&project_root);
         let (user_host, turns) = load_script(&project_root);
         let last_script_contents = std::fs::read_to_string(project_root.join("script.json")).ok();
         // The window-title field starts empty: its hint is derived
@@ -502,7 +643,58 @@ impl TermAnimApp {
             last_output: None,
             status_log: String::new(),
             script_name: String::new(),
+            library,
+            library_filter: String::new(),
+            opened_script: None,
+            pending_open: None,
+            library_error: None,
             rx: None,
+        }
+    }
+
+    // A pick from the script picker. Asks first when it would throw away
+    // edits that exist nowhere else.
+    fn request_open_script(&mut self, name: String) {
+        if has_unsaved_edits(
+            &self.user_host,
+            &self.turns,
+            self.last_script_contents.as_deref(),
+        ) {
+            self.pending_open = Some(name);
+        } else {
+            self.open_library_script(&name);
+        }
+    }
+
+    fn open_library_script(&mut self, name: &str) {
+        match load_library_script(&self.project_root, name) {
+            Ok((user_host, turns)) => {
+                self.user_host = user_host;
+                self.turns = turns;
+                self.script_name = name.to_string();
+                self.opened_script = Some(name.to_string());
+                self.library_error = None;
+                // Write it straight through to script.json, which also moves
+                // the poller's baseline to these exact bytes. Without this the
+                // next poll sees script.json disagree with the editor: it
+                // either reports our own write as an external change, or, if
+                // script.json was left alone, swaps the picked script back
+                // out the next time anything touches that file.
+                match self.save_script_file() {
+                    Ok(()) => self
+                        .status_log
+                        .push_str(&format!("opened saved script \"{name}\"\n")),
+                    Err(e) => {
+                        self.status_log.push_str(&format!("error: {e}\n"));
+                        self.library_error = Some(e);
+                    }
+                }
+            }
+            Err(e) => {
+                let message = format!("Couldn't open \"{name}\": {e}");
+                self.status_log.push_str(&format!("error: {message}\n"));
+                self.library_error = Some(message);
+            }
         }
     }
 
@@ -856,11 +1048,15 @@ impl TermAnimApp {
         {
             match self.pending_done.take() {
                 Some(PendingDone::Record(Ok(path))) => {
+                    self.library = library_entries(&self.project_root);
                     self.status_log
                         .push_str(&format!("done: {}\n", path.display()));
                     self.last_output = Some(path);
                 }
                 Some(PendingDone::Record(Err(e))) => {
+                    // The script was filed before record.sh ran, so the
+                    // library may have changed even though recording failed.
+                    self.library = library_entries(&self.project_root);
                     self.status_log.push_str(&format!("error: {e}\n"));
                     self.last_error = Some(e);
                 }
@@ -1170,6 +1366,101 @@ impl eframe::App for TermAnimApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Turns");
             ui.label("Each turn is a command that gets typed out, followed by its output.");
+            // Recording writes script.json and the library from the worker
+            // thread, so no picking while it runs.
+            ui.add_enabled_ui(!self.busy && self.root_ok, |ui| {
+                let mut picked: Option<String> = None;
+                ui.horizontal(|ui| {
+                    ui.label("Script");
+                    let combo_button_id = combo_button_id(ui, "script_combo");
+                    let popup_id = combo_button_id.with("popup");
+                    let combo_was_open = egui::ComboBox::is_open(&ctx, combo_button_id);
+                    let selected_text: egui::WidgetText = match &self.opened_script {
+                        Some(name) => name.as_str().into(),
+                        None if self.library.is_empty() => {
+                            egui::RichText::new("(no saved scripts)").weak().into()
+                        }
+                        None => egui::RichText::new("choose...").weak().into(),
+                    };
+                    egui::ComboBox::from_id_salt("script_combo")
+                        .selected_text(selected_text)
+                        .width(160.0)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show_ui(ui, |ui| {
+                            if !combo_was_open {
+                                self.library = library_entries(&self.project_root);
+                                self.library_filter.clear();
+                            }
+                            if self.library.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Nothing saved yet. Every recording files the \
+                                         current script here.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                return;
+                            }
+                            ui.set_min_width(340.0);
+                            let search_response = ui.add(
+                                egui::TextEdit::singleline(&mut self.library_filter)
+                                    .hint_text("search scripts...")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if !combo_was_open {
+                                search_response.request_focus();
+                            }
+                            ui.separator();
+                            let filter = self.library_filter.to_lowercase();
+                            let now = SystemTime::now();
+                            egui::ScrollArea::vertical()
+                                .max_height(320.0)
+                                .show(ui, |ui| {
+                                    for entry in &self.library {
+                                        if !(filter.is_empty()
+                                            || entry.name.to_lowercase().contains(&filter))
+                                        {
+                                            continue;
+                                        }
+                                        let selected = self.opened_script.as_deref()
+                                            == Some(entry.name.as_str());
+                                        let hint = egui::RichText::new(library_hint(entry, now))
+                                            .small()
+                                            .weak();
+                                        let row =
+                                            egui::Button::selectable(selected, entry.name.as_str())
+                                                .right_text(hint)
+                                                .min_size(egui::vec2(ui.available_width(), 0.0));
+                                        if ui.add(row).clicked() {
+                                            picked = Some(entry.name.clone());
+                                        }
+                                    }
+                                });
+                        });
+                    if picked.is_some() {
+                        egui::Popup::close_id(&ctx, popup_id);
+                    }
+                    ui.label("Name");
+                    let first_command = self.turns.first().map(|t| t.command.as_str());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.script_name)
+                            .hint_text(script_library::suggest_name(first_command.unwrap_or("")))
+                            .desired_width(190.0),
+                    );
+                });
+                if let Some(caption) =
+                    script_name_caption(&self.project_root, &self.script_name, &self.turns)
+                {
+                    ui.label(egui::RichText::new(caption).small().weak());
+                }
+                if let Some(err) = &self.library_error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                }
+                if let Some(name) = picked {
+                    self.request_open_script(name);
+                }
+            });
             ui.horizontal(|ui| {
                 if ui.button("Add turn").clicked() {
                     self.turns.push(Turn::default());
@@ -1269,6 +1560,37 @@ impl eframe::App for TermAnimApp {
                 self.turns.swap(i, i + 1);
             }
         });
+
+        if let Some(name) = self.pending_open.clone() {
+            let modal = egui::Modal::new(egui::Id::new("discard_unsaved_modal")).show(&ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading("Discard unsaved changes?");
+                ui.label(format!(
+                    "The editor has changes that aren't in script.json. Opening \"{name}\" \
+                     replaces them."
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Discard and open").clicked() {
+                        Some(true)
+                    } else if ui.button("Cancel").clicked() {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })
+                .inner
+            });
+            match modal.inner {
+                Some(true) => {
+                    self.pending_open = None;
+                    self.open_library_script(&name);
+                }
+                Some(false) => self.pending_open = None,
+                None if modal.should_close() => self.pending_open = None,
+                None => {}
+            }
+        }
     }
 }
 
@@ -1421,6 +1743,212 @@ mod tests {
         // A headless run produces texture deltas; drop them cleanly instead
         // of letting the debug assertion in epaint fire on drop.
         output.textures_delta.clear();
+    }
+
+    fn temp_project(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("term-anim-picker-{tag}-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn turn(command: &str, output: &str) -> Turn {
+        Turn {
+            command: command.to_string(),
+            output: output.to_string(),
+        }
+    }
+
+    fn save_to_library(root: &Path, name: &str, turns: &[Turn]) {
+        let json = serialize_script("kareem@offline-studios", turns).unwrap();
+        script_library::save(root, name, &json).unwrap();
+    }
+
+    fn set_age(root: &Path, name: &str, age: Duration) {
+        let path = script_library::scripts_dir(root).join(format!("{name}.json"));
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn library_entries_are_newest_first_with_summaries() {
+        let root = temp_project("entries");
+        save_to_library(&root, "old", &[turn("whoami", "")]);
+        save_to_library(&root, "newest", &[turn("ls", ""), turn("pwd", "")]);
+        save_to_library(&root, "middle", &[]);
+        set_age(&root, "old", Duration::from_secs(3 * 86_400));
+        set_age(&root, "middle", Duration::from_secs(2 * 3_600));
+        std::fs::write(
+            script_library::scripts_dir(&root).join("broken.json"),
+            "not json",
+        )
+        .unwrap();
+        set_age(&root, "broken", Duration::from_secs(30 * 86_400));
+
+        let entries = library_entries(&root);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["newest", "middle", "old", "broken"]);
+
+        let now = SystemTime::now();
+        assert!(
+            library_hint(&entries[0], now).starts_with("2 turns · ls · "),
+            "{}",
+            library_hint(&entries[0], now)
+        );
+        assert_eq!(library_hint(&entries[1], now), "0 turns · 2h ago");
+        assert_eq!(library_hint(&entries[2], now), "1 turn · whoami · 3d ago");
+        assert_eq!(library_hint(&entries[3], now), "unreadable · 4w ago");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn library_hint_shortens_long_first_commands() {
+        let entry = LibraryEntry {
+            name: "long".to_string(),
+            summary: Some((1, "x".repeat(50))),
+            modified: None,
+        };
+        let hint = library_hint(&entry, SystemTime::now());
+        assert_eq!(hint, format!("1 turn · {}...", "x".repeat(29)));
+    }
+
+    #[test]
+    fn format_age_picks_the_largest_whole_unit() {
+        assert_eq!(format_age(Duration::from_secs(0)), "just now");
+        assert_eq!(format_age(Duration::from_secs(59)), "just now");
+        assert_eq!(format_age(Duration::from_secs(60)), "1m ago");
+        assert_eq!(format_age(Duration::from_secs(20 * 60)), "20m ago");
+        assert_eq!(format_age(Duration::from_secs(3_600)), "1h ago");
+        assert_eq!(format_age(Duration::from_secs(86_399)), "23h ago");
+        assert_eq!(format_age(Duration::from_secs(86_400)), "1d ago");
+        assert_eq!(format_age(Duration::from_secs(604_800)), "1w ago");
+        assert_eq!(format_age(Duration::from_secs(10 * 604_800)), "10w ago");
+    }
+
+    #[test]
+    fn unsaved_edits_ignore_formatting_but_not_content() {
+        let turns = vec![turn("whoami", "{{1;36}}Kareem{{0}}")];
+        let saved = serialize_script("me@host", &turns).unwrap();
+        assert!(!has_unsaved_edits("me@host", &turns, Some(&saved)));
+
+        // Same script, reformatted by an external editor.
+        let compact: ScriptFile = serde_json::from_str(&saved).unwrap();
+        let compact = serde_json::to_string(&compact).unwrap();
+        assert_ne!(compact, saved);
+        assert!(!has_unsaved_edits("me@host", &turns, Some(&compact)));
+
+        let edited = vec![turn("whoami", "{{1;36}}Someone else{{0}}")];
+        assert!(has_unsaved_edits("me@host", &edited, Some(&saved)));
+        assert!(has_unsaved_edits("other@host", &turns, Some(&saved)));
+
+        // No script.json yet: only real turns are worth asking about.
+        assert!(!has_unsaved_edits("me@host", &[], None));
+        assert!(has_unsaved_edits("me@host", &turns, None));
+    }
+
+    #[test]
+    fn name_caption_suggests_announces_new_and_stays_silent_on_overwrite() {
+        let root = temp_project("caption");
+        let turns = vec![turn("git status", "")];
+        assert_eq!(
+            script_name_caption(&root, "  ", &turns).unwrap(),
+            "Empty name: recording saves this as \"git-status\" (from the first command)."
+        );
+        assert_eq!(
+            script_name_caption(&root, "Launch Banner", &turns).unwrap(),
+            "New script - recording saves it as \"launch-banner\"."
+        );
+        save_to_library(&root, "launch-banner", &turns);
+        assert_eq!(script_name_caption(&root, "Launch Banner", &turns), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_a_saved_script_syncs_script_json_without_tripping_the_poller() {
+        let root = temp_project("open");
+        let script_json = root.join("script.json");
+        write_script(&script_json, "before@host", &[turn("ls", "")]).unwrap();
+        let library_turns = vec![turn("whoami", "{{1;36}}Kareem{{0}}")];
+        save_to_library(&root, "launch-banner", &library_turns);
+
+        let mut app = TermAnimApp::with_root(root.clone());
+        app.request_open_script("launch-banner".to_string());
+
+        assert_eq!(app.pending_open, None, "nothing unsaved, so no confirm");
+        assert_eq!(app.user_host, "kareem@offline-studios");
+        assert_eq!(app.turns.len(), 1);
+        assert_eq!(app.turns[0].output, "{{1;36}}Kareem{{0}}");
+        assert_eq!(app.script_name, "launch-banner");
+        assert_eq!(app.opened_script.as_deref(), Some("launch-banner"));
+        assert_eq!(
+            std::fs::read_to_string(&script_json).unwrap(),
+            script_library::load(&root, "launch-banner").unwrap(),
+            "script.json must hold the opened script"
+        );
+        assert!(
+            script_contents_if_changed(&script_json, &mut app.last_script_contents).is_none(),
+            "the poller would report the app's own write as an external change"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_over_unsaved_edits_waits_for_confirmation() {
+        let root = temp_project("dirty");
+        write_script(&root.join("script.json"), "me@host", &[turn("ls", "")]).unwrap();
+        save_to_library(&root, "other", &[turn("whoami", "")]);
+
+        let mut app = TermAnimApp::with_root(root.clone());
+        app.turns[0].command = "ls -la".to_string();
+        app.request_open_script("other".to_string());
+
+        assert_eq!(app.pending_open.as_deref(), Some("other"));
+        assert_eq!(
+            app.turns[0].command, "ls -la",
+            "edits must survive until confirmed"
+        );
+        assert_eq!(app.opened_script, None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_open_leaves_the_editor_and_script_json_alone() {
+        let root = temp_project("fail");
+        let script_json = root.join("script.json");
+        write_script(&script_json, "me@host", &[turn("ls", "")]).unwrap();
+        let before = std::fs::read_to_string(&script_json).unwrap();
+        save_to_library(&root, "broken", &[]);
+        std::fs::write(
+            script_library::scripts_dir(&root).join("broken.json"),
+            "not json",
+        )
+        .unwrap();
+
+        let mut app = TermAnimApp::with_root(root.clone());
+        app.request_open_script("broken".to_string());
+        assert_eq!(
+            app.library_error.as_deref(),
+            Some("Couldn't open \"broken\": not a valid script file")
+        );
+        app.request_open_script("deleted".to_string());
+        let error = app.library_error.clone().unwrap();
+        assert!(
+            error.starts_with("Couldn't open \"deleted\": no saved script"),
+            "{error}"
+        );
+
+        assert_eq!(app.turns.len(), 1);
+        assert_eq!(app.turns[0].command, "ls");
+        assert_eq!(app.opened_script, None);
+        assert_eq!(std::fs::read_to_string(&script_json).unwrap(), before);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
