@@ -9,6 +9,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod script_library;
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct Turn {
     command: String,
@@ -164,6 +166,10 @@ struct TermAnimApp {
     last_error: Option<String>,
     last_output: Option<PathBuf>,
     status_log: String,
+    // Name this script is filed under in the gitignored script library
+    // (see script_library). Empty means "not named yet": a recording falls
+    // back to suggest_name on the first turn's command.
+    script_name: String,
     rx: Option<Receiver<WorkerMsg>>,
 }
 
@@ -495,6 +501,7 @@ impl TermAnimApp {
             last_error: None,
             last_output: None,
             status_log: String::new(),
+            script_name: String::new(),
             rx: None,
         }
     }
@@ -557,6 +564,7 @@ impl TermAnimApp {
         let bg_to = color32_to_hex(gradient_to);
         let padding = self.padding;
         let scale = SCALE_PRESETS[self.scale_index].1;
+        let script_name = self.script_name.clone();
 
         // Rough estimate for the progress bar, not meant to be exact:
         let total_chars: usize = turns.iter().map(|t| t.command.chars().count()).sum();
@@ -582,10 +590,40 @@ impl TermAnimApp {
                 let script = ScriptFile { user_host, turns };
                 let json = serde_json::to_string_pretty(&script)
                     .map_err(|e| format!("failed to serialize script.json: {e}"))?;
-                std::fs::write(&script_path, json)
+                std::fs::write(&script_path, &json)
                     .map_err(|e| format!("failed to write script.json: {e}"))?;
                 tx.send(WorkerMsg::Log(format!("wrote {}", script_path.display())))
                     .ok();
+
+                // File the very same script into the gitignored library, so
+                // the two files can never disagree. A failure here is only
+                // a warning: the recording and the render still go ahead.
+                let name = if script_name.trim().is_empty() {
+                    script_library::suggest_name(
+                        script
+                            .turns
+                            .first()
+                            .map(|turn| turn.command.as_str())
+                            .unwrap_or(""),
+                    )
+                } else {
+                    script_name.clone()
+                };
+                match script_library::save(&root, &name, &json) {
+                    Ok(slug) => tx
+                        .send(WorkerMsg::Log(format!(
+                            "saved script to {}",
+                            script_library::scripts_dir(&root)
+                                .join(format!("{slug}.json"))
+                                .display()
+                        )))
+                        .ok(),
+                    Err(e) => tx
+                        .send(WorkerMsg::Log(format!(
+                            "warning: could not save script to the library: {e}"
+                        )))
+                        .ok(),
+                };
 
                 tx.send(WorkerMsg::Log(format!(
                     "running: ./record.sh {theme} {speed} {loop_delay_ms}"
